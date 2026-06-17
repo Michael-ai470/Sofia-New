@@ -578,16 +578,37 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 
 def extract_docx_text(file_bytes: bytes) -> str:
+    from docx.oxml.ns import qn
     doc = Document(io.BytesIO(file_bytes))
     lines = []
-    for para in doc.paragraphs:
+
+    def _collect_para(para):
         text = para.text.strip()
         if not text:
-            continue
+            return
         if para.style.name.startswith('Heading'):
             lines.append(text.upper())
         else:
             lines.append(text)
+
+    # Main body text flow
+    for para in doc.paragraphs:
+        _collect_para(para)
+
+    # Table cells — not included in doc.paragraphs
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _collect_para(para)
+
+    # Text boxes — floating frames invisible to the python-docx API
+    for shape in doc.element.body.iter(qn('w:txbxContent')):
+        for p_elem in shape.iter(qn('w:p')):
+            text = "".join(t.text for t in p_elem.iter(qn('w:t'))).strip()
+            if text:
+                lines.append(text)
+
     raw = "\n".join(lines)
     raw = re.sub(r'\n{3,}', '\n\n', raw)
     return raw.strip()
@@ -618,11 +639,14 @@ def extract_text():
 
         if filename.endswith(".pdf"):
             text = extract_pdf_text(file_bytes)
-        elif filename.endswith((".docx", ".doc")):
+        elif filename.endswith(".docx"):
             text = extract_docx_text(file_bytes)
+        elif filename.endswith(".doc"):
+            return jsonify({"status": "error",
+                            "message": "Old .doc format is not supported. Re-save your CV as .docx in Word and try again."}), 400
         else:
             return jsonify({"status": "error",
-                            "message": "Unsupported file type. Upload PDF or Word (.docx)."}), 400
+                            "message": "Unsupported file type. Upload a PDF or Word (.docx) file."}), 400
 
         if len(text) > MAX_CV_CHARS:
             text = text[:MAX_CV_CHARS]

@@ -184,8 +184,10 @@ function CandidateRow({ index, cv, onChange, onRemove, onUpload }) {
       setErr(`File is over ${MAX_UPLOAD_MB} MB. Upload a smaller file or paste the text.`);
       return;
     }
-    if (!/\.(pdf|docx?|txt)$/i.test(file.name)) {
-      setErr("Use a PDF, Word, or text file — or paste the CV text.");
+    if (!/\.(pdf|docx|txt)$/i.test(file.name)) {
+      setErr(file.name.toLowerCase().endsWith(".doc")
+        ? "Old .doc format is not supported. Re-save as .docx in Word and try again."
+        : "Use a PDF, .docx, or .txt file — or paste the CV text.");
       return;
     }
     setBusy(true);
@@ -230,7 +232,7 @@ function CandidateRow({ index, cv, onChange, onRemove, onUpload }) {
         }}
       />
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 8 }}>
-        <input ref={fileRef} type="file" accept=".pdf,.doc,.docx,.txt"
+        <input ref={fileRef} type="file" accept=".pdf,.docx,.txt"
           onChange={handleFile} style={{ display: "none" }} id={`file-${index}`} />
         <label htmlFor={`file-${index}`} style={{
           ...btn(C.border), color: C.text, cursor: "pointer", fontSize: 13, padding: "8px 14px",

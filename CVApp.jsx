@@ -518,8 +518,10 @@ export default function CVApp({ backendUrl = "http://localhost:5000" }) {
       setErr("extract", `That file is larger than ${MAX_UPLOAD_MB} MB. Please upload a smaller PDF or .docx.`);
       return;
     }
-    if (!/\.(pdf|docx?|)$/i.test(file.name)) {
-      setErr("extract", "Unsupported file type. Upload a PDF or Word (.docx) file.");
+    if (!/\.(pdf|docx)$/i.test(file.name)) {
+      setErr("extract", file.name.toLowerCase().endsWith(".doc")
+        ? "Old .doc format is not supported. Re-save your CV as .docx in Word and try again."
+        : "Unsupported file type. Upload a PDF or Word (.docx) file.");
       return;
     }
     setLoad("extract", true);
@@ -665,7 +667,7 @@ export default function CVApp({ backendUrl = "http://localhost:5000" }) {
             <div style={{ color: "#6B6B8A", fontSize: 11, marginBottom: 8 }}>PDF or Word &mdash; extracted to text automatically (max {MAX_UPLOAD_MB} MB)</div>
             <div style={S.uploadBox} onClick={() => fileRef.current?.click()}>
               {loading.extract ? <>Extracting<Ellipsis /></> : "Click to upload PDF or .docx"}
-              <input ref={fileRef} type="file" accept=".pdf,.doc,.docx" style={{ display: "none" }}
+              <input ref={fileRef} type="file" accept=".pdf,.docx" style={{ display: "none" }}
                 onChange={e => handleFileUpload(e.target.files[0])} />
             </div>
             {errors.extract && <div style={{ color: "#EF4444", fontSize: 11, marginTop: 6 }}>{errors.extract}</div>}
