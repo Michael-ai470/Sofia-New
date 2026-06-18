@@ -634,12 +634,15 @@ def ai_json(model, system, user, max_tokens):
         text, stop = call_claude(model, system, user, max_tokens)
         if stop == "max_tokens":
             last_err = "The model response was cut off (max_tokens). Try a shorter input."
-            # Still attempt a parse — partial objects sometimes parse after trimming.
+            log.warning("ai_json max_tokens model=%s attempt=%d — output truncated", model, attempt + 1)
         try:
             return parse_json(text)
         except (json.JSONDecodeError, ValueError) as e:
             last_err = "The model returned output that was not valid JSON."
-            log.warning("JSON parse failed (attempt %d): %s", attempt + 1, e)
+            if attempt == 0:
+                log.warning("ai_json parse failed model=%s attempt=1 — retrying: %s", model, e)
+            else:
+                log.error("ai_json parse failed model=%s attempt=2 — giving up: %s", model, e)
     raise ValueError(last_err or "The model returned malformed output.")
 
 
