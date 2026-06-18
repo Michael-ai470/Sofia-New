@@ -29,7 +29,12 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
+from collections import defaultdict
+from functools import wraps
+from logging.handlers import RotatingFileHandler
+from threading import Lock
 
 import anthropic
 import pdfplumber
@@ -48,8 +53,52 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 load_dotenv()
 
+# --------------------------------------------------------------------------- #
+#  LOGGING                                                                     #
+# --------------------------------------------------------------------------- #
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sofia")
+
+
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per line — easy to tail, parse, and forward."""
+    def format(self, record):
+        doc = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            doc["exc"] = self.formatException(record.exc_info)
+        return json.dumps(doc)
+
+
+_fh = RotatingFileHandler("sofia.log", maxBytes=5 * 1024 * 1024, backupCount=3)
+_fh.setLevel(logging.WARNING)
+_fh.setFormatter(_JsonFormatter())
+logging.getLogger().addHandler(_fh)
+
+# Optional Sentry — activates when SENTRY_DSN env var is set.
+# To enable: pip install sentry-sdk[flask]  and set SENTRY_DSN=https://...@sentry.io/...
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.flask import FlaskIntegration
+    from sentry_sdk.integrations.logging import LoggingIntegration as _SentryLogging
+
+    _SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
+    if _SENTRY_DSN:
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            integrations=[
+                FlaskIntegration(),
+                _SentryLogging(level=logging.WARNING, event_level=logging.ERROR),
+            ],
+            traces_sample_rate=0.1,
+            environment=os.environ.get("SOFIA_ENV", "development"),
+        )
+        log.info("Sentry active (env=%s)", os.environ.get("SOFIA_ENV", "development"))
+except ImportError:
+    pass  # sentry-sdk not installed; pip install sentry-sdk[flask] when deploying
 
 # --------------------------------------------------------------------------- #
 #  CONFIG                                                                      #
@@ -68,6 +117,18 @@ MAX_RANK_CHARS = 8_000   # per CV before the AI sees it
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 CORS(app, origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else "*")
+
+SOFIA_ENV = os.environ.get("SOFIA_ENV", "development").strip()
+
+# Production safety guard — refuse to start with unsafe defaults.
+if SOFIA_ENV == "production":
+    if DEBUG_MODE:
+        raise SystemExit("FATAL: SOFIA_DEBUG=1 is not allowed in production.")
+    if ALLOWED_ORIGINS == ["*"]:
+        raise SystemExit("FATAL: SOFIA_ALLOWED_ORIGINS=* is not allowed in production. "
+                         "Set it to your frontend domain.")
+    if not API_KEY:
+        raise SystemExit("FATAL: ANTHROPIC_API_KEY is not set in production.")
 
 if not API_KEY:
     # Fail loud rather than booting a server whose every AI route 500s (A2).
@@ -158,6 +219,47 @@ def fail(message, status=500, exc=None):
 def too_large(_e):
     return jsonify({"status": "error",
                     "message": f"File exceeds the {MAX_UPLOAD_MB} MB limit."}), 413
+
+
+# --------------------------------------------------------------------------- #
+#  RATE LIMITING (sliding window per IP — no external dependency)             #
+#  Switch key from request.remote_addr to user ID once auth exists.           #
+# --------------------------------------------------------------------------- #
+_rl_store: dict = defaultdict(list)
+_rl_lock = Lock()
+
+
+def rate_limit(calls: int, window: int):
+    """Allow at most `calls` requests per `window` seconds per client IP."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            ip = request.remote_addr or "unknown"
+            key = f"{f.__name__}:{ip}"
+            now = time.time()
+            cutoff = now - window
+            with _rl_lock:
+                timestamps = [t for t in _rl_store[key] if t > cutoff]
+                if len(timestamps) >= calls:
+                    err_id = uuid.uuid4().hex[:12]
+                    log.warning("rate_limit_exceeded error_id=%s route=%s ip=%s",
+                                err_id, f.__name__, ip)
+                    return jsonify({
+                        "status": "error",
+                        "message": "Too many requests. Please wait a moment and try again.",
+                        "errorId": err_id,
+                    }), 429
+                timestamps.append(now)
+                _rl_store[key] = timestamps
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+@app.errorhandler(429)
+def rate_limited(_e):
+    return jsonify({"status": "error",
+                    "message": "Too many requests. Please wait a moment and try again."}), 429
 
 
 # --------------------------------------------------------------------------- #
@@ -629,6 +731,7 @@ def detect_sections(text: str) -> list:
 #  ROUTE — TEXT EXTRACTION                                                    #
 # --------------------------------------------------------------------------- #
 @app.route("/extract-text", methods=["POST"])
+@rate_limit(30, 3600)   # 30 per hour — prevent free file-parsing abuse
 def extract_text():
     try:
         if "file" not in request.files:
@@ -667,6 +770,7 @@ def extract_text():
 #  ROUTES — AI CALLS                                                          #
 # --------------------------------------------------------------------------- #
 @app.route("/analyse-cv", methods=["POST"])
+@rate_limit(10, 3600)   # 10 per hour
 def analyse_cv():
     try:
         require_credits(ROUTE_COST["/analyse-cv"])  # 0 by design; pairs with rewrite
@@ -692,6 +796,7 @@ def analyse_cv():
 
 
 @app.route("/rewrite-cv", methods=["POST"])
+@rate_limit(10, 3600)   # 10 per hour
 def rewrite_cv():
     try:
         user_obj, charge = require_credits(ROUTE_COST["/rewrite-cv"])
@@ -722,6 +827,7 @@ def rewrite_cv():
 
 
 @app.route("/cover-letter", methods=["POST"])
+@rate_limit(10, 3600)   # 10 per hour
 def cover_letter():
     try:
         _u, charge = require_credits(ROUTE_COST["/cover-letter"])
@@ -752,6 +858,7 @@ def cover_letter():
 
 
 @app.route("/rank-cvs", methods=["POST"])
+@rate_limit(5, 3600)    # 5 per hour — each call can rank up to 20 CVs
 def rank_cvs():
     try:
         data = request.get_json(force=True) or {}
@@ -801,6 +908,7 @@ def rank_cvs():
 
 
 @app.route("/generate-plan", methods=["POST"])
+@rate_limit(5, 3600)    # 5 per hour — 5 credits per call
 def generate_plan():
     try:
         _u, charge = require_credits(ROUTE_COST["/generate-plan"])
