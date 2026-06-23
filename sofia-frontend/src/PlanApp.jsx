@@ -2,37 +2,30 @@ import React, { useState } from "react";
 
 /**
  * PlanApp — Sofia Business Plan Engine (Engine 3)
+ * White theme — matches the landing page palette.
  *
  *  - Short intake form + grant picker
  *  - One call to /generate-plan { grantId, formData }
- *  - Server decides what is free vs paid; this UI NEVER assumes it has
- *    gated content. If data[section] === null and gated[section] === true,
- *    it shows an upgrade prompt instead of inventing text.
- *  - Use-of-funds table is rendered when present; server-side `warnings`
- *    (e.g. funds not summing to the ask) are surfaced honestly.
- *  - Free preview = whatever the server returns in `freeSections`.
- *
- * Props:
- *   backendUrl   Flask base URL (default http://localhost:5000)
- *   isPaid       optional UI hint only; the SERVER is the source of truth
+ *  - Server decides free vs paid; this UI NEVER assumes it has gated content.
+ *  - Use-of-funds table rendered when present; server-side warnings surfaced honestly.
  */
 
-/* ----------------------------------------------------------------- *
- *  Shared palette (must match CVApp.jsx / RecruiterApp.jsx)          *
- * ----------------------------------------------------------------- */
+/* ─── Palette (matches LandingPage / CVFlow) ───────────────────────── */
 const C = {
-  bg: "#0A0A0F",
-  surface: "#111118",
-  border: "#1E1E2E",
+  bg: "#FFFFFF",
+  surface: "#F8F7F5",
+  border: "#E8E8E8",
   gold: "#B89A68",
-  action: "#6C63FF",
-  text: "#F1F0FF",
-  muted: "#6B6B8A",
+  goldLight: "#F5EFE6",
+  text: "#1A1A1A",
+  muted: "#6B6B6B",
+  green: "#22C55E",
+  red: "#EF4444",
+  amber: "#F59E0B",
 };
 
-function normBase(url) {
-  return (url || "").replace(/\/+$/, "");
-}
+/* ─── Backend helpers ───────────────────────────────────────────────── */
+function normBase(url) { return (url || "").replace(/\/+$/, ""); }
 
 async function api(backendUrl, path, body) {
   const res = await fetch(`${normBase(backendUrl)}${path}`, {
@@ -48,17 +41,15 @@ async function api(backendUrl, path, body) {
   return data;
 }
 
-/* Grant list mirrors GRANT_LIBRARY keys in app.py. Labels only —
-   the server owns the structure and the free/paid decision. */
+/* Grant list mirrors GRANT_LIBRARY keys in app.py */
 const GRANTS = [
-  { id: "general", name: "General business plan", blurb: "Investors, banks, or internal use." },
-  { id: "tef", name: "Tony Elumelu Foundation", blurb: "African impact, jobs, scalability." },
-  { id: "hult", name: "Hult Prize", blurb: "UN SDG-led, globally minded, data-rigorous." },
-  { id: "yali", name: "YALI Mandela Washington Fellowship", blurb: "Leadership story, community impact." },
-  { id: "seedstars", name: "Seedstars Africa Ventures", blurb: "Traction-first, investor-grade." },
+  { id: "general",    name: "General business plan",           blurb: "Investors, banks, or internal use." },
+  { id: "tef",        name: "Tony Elumelu Foundation",         blurb: "African impact, jobs, scalability." },
+  { id: "hult",       name: "Hult Prize",                      blurb: "UN SDG-led, globally minded, data-rigorous." },
+  { id: "yali",       name: "YALI Mandela Washington",         blurb: "Leadership story, community impact." },
+  { id: "seedstars",  name: "Seedstars Africa Ventures",       blurb: "Traction-first, investor-grade." },
 ];
 
-/* Section key → human label. Unknown keys fall back to a de-camelCased title. */
 const SECTION_LABELS = {
   executiveSummary: "Executive summary",
   problemStatement: "Problem", problem: "Problem", problemAndSDG: "Problem & SDG",
@@ -82,10 +73,14 @@ function labelFor(key) {
   return key.replace(/([A-Z])/g, " $1").replace(/^./, c => c.toUpperCase()).trim();
 }
 
-/* ----------------------------------------------------------------- *
- *  Atoms                                                             *
- * ----------------------------------------------------------------- */
-function Ellipsis() {
+function money(n) {
+  const v = Number(n);
+  if (!isFinite(v)) return "—";
+  return "$" + v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+/* ─── Atoms ─────────────────────────────────────────────────────────── */
+function Dots() {
   const [n, setN] = React.useState(1);
   React.useEffect(() => {
     const id = setInterval(() => setN(v => (v % 3) + 1), 450);
@@ -94,38 +89,79 @@ function Ellipsis() {
   return <span>{".".repeat(n)}</span>;
 }
 
-const card = {
-  background: C.surface, border: `1px solid ${C.border}`,
-  borderRadius: 14, padding: 20,
-};
-const label = {
-  fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase",
-  color: C.gold, fontWeight: 600,
+const cardStyle = {
+  background: C.surface,
+  border: `1px solid ${C.border}`,
+  borderRadius: 14,
+  padding: 20,
 };
 
-function btn(bg, disabled) {
-  return {
-    background: disabled ? C.border : bg, color: disabled ? C.muted : "#fff",
-    border: "none", borderRadius: 10, padding: "11px 18px", fontSize: 14,
-    fontWeight: 600, cursor: disabled ? "not-allowed" : "pointer", fontFamily: "inherit",
-  };
+const sectionLabel = {
+  fontSize: 11,
+  letterSpacing: "0.13em",
+  textTransform: "uppercase",
+  color: C.muted,
+  fontWeight: 700,
+};
+
+function PrimaryBtn({ children, onClick, disabled }) {
+  return (
+    <button onClick={disabled ? undefined : onClick} style={{
+      background: disabled ? C.border : C.gold,
+      color: disabled ? C.muted : "#fff",
+      border: "none", borderRadius: 10,
+      padding: "12px 22px", fontSize: 14,
+      fontWeight: 600, cursor: disabled ? "not-allowed" : "pointer",
+      fontFamily: "inherit",
+    }}>
+      {children}
+    </button>
+  );
 }
 
-function Field({ label: lbl, value, onChange, placeholder, type = "text", rows }) {
-  const base = {
-    width: "100%", boxSizing: "border-box", background: C.bg,
-    border: `1px solid ${C.border}`, borderRadius: 8, color: C.text,
-    padding: "9px 11px", fontSize: 14, fontFamily: "inherit",
+function SecondaryBtn({ children, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      background: "transparent", color: C.muted,
+      border: `1px solid ${C.border}`, borderRadius: 10,
+      padding: "11px 20px", fontSize: 14,
+      fontWeight: 500, cursor: "pointer", fontFamily: "inherit",
+    }}>
+      {children}
+    </button>
+  );
+}
+
+function Field({ label: lbl, value, onChange, placeholder, rows }) {
+  const baseInput = {
+    width: "100%", boxSizing: "border-box",
+    background: C.bg, border: `1px solid ${C.border}`,
+    borderRadius: 8, color: C.text,
+    padding: "9px 11px", fontSize: 14,
+    fontFamily: "inherit", outline: "none",
   };
   return (
     <div>
       <div style={{ fontSize: 13, color: C.muted, marginBottom: 5 }}>{lbl}</div>
       {rows ? (
-        <textarea value={value} onChange={e => onChange(e.target.value)}
-          placeholder={placeholder} rows={rows} style={{ ...base, resize: "vertical" }} />
+        <textarea
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          placeholder={placeholder}
+          rows={rows}
+          style={{ ...baseInput, resize: "vertical" }}
+          onFocus={e => (e.target.style.borderColor = C.gold)}
+          onBlur={e => (e.target.style.borderColor = C.border)}
+        />
       ) : (
-        <input value={value} onChange={e => onChange(e.target.value)}
-          placeholder={placeholder} type={type} style={base} />
+        <input
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          placeholder={placeholder}
+          style={baseInput}
+          onFocus={e => (e.target.style.borderColor = C.gold)}
+          onBlur={e => (e.target.style.borderColor = C.border)}
+        />
       )}
     </div>
   );
@@ -133,40 +169,34 @@ function Field({ label: lbl, value, onChange, placeholder, type = "text", rows }
 
 function ErrorCard({ message, onRetry }) {
   return (
-    <div style={{ ...card, borderColor: "#EF4444", marginTop: 16 }}>
-      <div style={{ color: "#EF4444", fontWeight: 600, marginBottom: 6 }}>Couldn’t generate the plan</div>
+    <div style={{ background: "#FEF2F2", border: `1px solid ${C.red}33`, borderRadius: 12, padding: "16px 18px", marginTop: 16 }}>
+      <div style={{ color: C.red, fontWeight: 600, marginBottom: 6 }}>Couldn't generate the plan</div>
       <div style={{ color: C.text, fontSize: 14, marginBottom: onRetry ? 14 : 0 }}>{message}</div>
-      {onRetry && <button onClick={onRetry} style={btn(C.action)}>Try again</button>}
+      {onRetry && <PrimaryBtn onClick={onRetry}>Try again</PrimaryBtn>}
     </div>
   );
 }
 
-/* Money formatting that never invents precision. */
-function money(n) {
-  const v = Number(n);
-  if (!isFinite(v)) return "—";
-  return "$" + v.toLocaleString(undefined, { maximumFractionDigits: 0 });
-}
-
-/* ----------------------------------------------------------------- *
- *  Section renderers                                                 *
- * ----------------------------------------------------------------- */
+/* ─── Section renderers ─────────────────────────────────────────────── */
 function LockedSection({ name }) {
   return (
     <div style={{
-      ...card,
+      ...cardStyle,
       borderStyle: "dashed",
-      display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16,
+      display: "flex", alignItems: "center",
+      justifyContent: "space-between", gap: 16,
     }}>
       <div>
-        <div style={{ ...label, marginBottom: 6 }}>{name}</div>
+        <div style={{ ...sectionLabel, marginBottom: 6 }}>{name}</div>
         <div style={{ color: C.muted, fontSize: 14 }}>
           Part of the full plan. Upgrade to unlock financials, operations, and go-to-market.
         </div>
       </div>
       <div style={{
-        flexShrink: 0, color: C.gold, border: `1px solid ${C.gold}`,
-        borderRadius: 999, padding: "6px 12px", fontSize: 12, fontWeight: 600,
+        flexShrink: 0, color: C.gold,
+        border: `1px solid ${C.gold}`,
+        borderRadius: 999, padding: "6px 12px",
+        fontSize: 12, fontWeight: 600,
       }}>🔒 Paid</div>
     </div>
   );
@@ -174,46 +204,46 @@ function LockedSection({ name }) {
 
 function TextSection({ name, body }) {
   return (
-    <div style={card}>
-      <div style={{ ...label, marginBottom: 10 }}>{name}</div>
+    <div style={cardStyle}>
+      <div style={{ ...sectionLabel, marginBottom: 12 }}>{name}</div>
       {String(body).split(/\n{2,}/).map((para, i) => (
-        <p key={i} style={{
-          margin: i === 0 ? "0 0 12px" : "0 0 12px", fontSize: 14.5,
-          lineHeight: 1.65, color: C.text,
-        }}>{para.trim()}</p>
+        <p key={i} style={{ margin: "0 0 12px", fontSize: 14.5, lineHeight: 1.7, color: C.text }}>
+          {para.trim()}
+        </p>
       ))}
     </div>
   );
 }
 
-function FundsTable({ rows, ask, warnings }) {
+function FundsTable({ rows, warnings }) {
   const total = rows.reduce((s, r) => s + (Number(r.amountUSD) || 0), 0);
   return (
-    <div style={card}>
-      <div style={{ ...label, marginBottom: 12 }}>Use of funds</div>
+    <div style={cardStyle}>
+      <div style={{ ...sectionLabel, marginBottom: 14 }}>Use of funds</div>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
         <tbody>
           {rows.map((r, i) => (
             <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
-              <td style={{ padding: "9px 0", color: C.text }}>{r.item}</td>
-              <td style={{ padding: "9px 0", color: C.gold, textAlign: "right", fontWeight: 600 }}>
+              <td style={{ padding: "10px 0", color: C.text }}>{r.item}</td>
+              <td style={{ padding: "10px 0", color: C.gold, textAlign: "right", fontWeight: 600 }}>
                 {money(r.amountUSD)}
               </td>
             </tr>
           ))}
           <tr>
-            <td style={{ padding: "11px 0 0", color: C.muted, fontWeight: 600 }}>Total</td>
-            <td style={{ padding: "11px 0 0", textAlign: "right", color: C.text, fontWeight: 700 }}>
+            <td style={{ padding: "12px 0 0", color: C.muted, fontWeight: 600 }}>Total</td>
+            <td style={{ padding: "12px 0 0", textAlign: "right", color: C.text, fontWeight: 700 }}>
               {money(total)}
             </td>
           </tr>
         </tbody>
       </table>
-      {warnings?.length > 0 && (
+      {(warnings || []).length > 0 && (
         <div style={{
           marginTop: 14, padding: "10px 12px", borderRadius: 8,
-          background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.35)",
-          color: "#F59E0B", fontSize: 13,
+          background: "rgba(245,158,11,0.08)",
+          border: "1px solid rgba(245,158,11,0.3)",
+          color: C.amber, fontSize: 13,
         }}>
           {warnings.map((w, i) => <div key={i}>{w}</div>)}
         </div>
@@ -222,10 +252,8 @@ function FundsTable({ rows, ask, warnings }) {
   );
 }
 
-/* ----------------------------------------------------------------- *
- *  Main component                                                    *
- * ----------------------------------------------------------------- */
-export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
+/* ─── Main component ────────────────────────────────────────────────── */
+export default function PlanApp({ backendUrl = "http://localhost:5000", onBack }) {
   const [grantId, setGrantId] = useState("general");
   const [form, setForm] = useState({
     businessName: "", industry: "", country: "", stage: "",
@@ -235,19 +263,19 @@ export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
   const [resp, setResp] = useState(null);
   const [error, setError] = useState("");
 
-  const set = (k) => (v) => setForm(f => ({ ...f, [k]: v }));
+  const set = k => v => setForm(f => ({ ...f, [k]: v }));
+
   const canGenerate =
-    form.businessName.trim() && form.industry.trim() &&
-    form.fundingAmount.trim() && form.description.trim().length >= 40;
+    form.businessName.trim() &&
+    form.industry.trim() &&
+    form.fundingAmount.trim() &&
+    form.description.trim().length >= 40;
 
   async function generate() {
     setError("");
     setPhase("generating");
     try {
-      const data = await api(backendUrl, "/generate-plan", {
-        grantId,
-        formData: form,
-      });
+      const data = await api(backendUrl, "/generate-plan", { grantId, formData: form });
       setResp(data);
       setPhase("done");
     } catch (ex) {
@@ -256,47 +284,71 @@ export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
     }
   }
 
-  function resetAll() {
-    setResp(null);
-    setError("");
-    setPhase("intake");
-  }
+  function resetAll() { setResp(null); setError(""); setPhase("intake"); }
 
-  // Render order = key order returned by the server (already in grant order).
   const sectionKeys = resp?.data
     ? Object.keys(resp.data).filter(k => k !== "useOfFundsTable")
     : [];
   const fundsRows = resp?.data?.useOfFundsTable;
 
   return (
-    <div style={{
-      background: C.bg, color: C.text, minHeight: "100%",
-      fontFamily: "'DM Sans', system-ui, sans-serif", padding: "28px 20px",
-    }}>
-      <div style={{ maxWidth: 760, margin: "0 auto" }}>
-        <div style={{ marginBottom: 8 }}><span style={label}>Sofia · Engine 3</span></div>
+    <div style={{ minHeight: "100svh", background: C.bg, fontFamily: "'DM Sans', system-ui, sans-serif" }}>
+      {/* Header */}
+      <header style={{
+        borderBottom: `1px solid ${C.border}`,
+        padding: "18px 24px",
+        display: "flex",
+        alignItems: "center",
+        position: "sticky",
+        top: 0,
+        background: C.bg,
+        zIndex: 10,
+      }}>
+        <span style={{ fontFamily: "'DM Serif Display', Georgia, serif", fontSize: 20, color: C.gold }}>Sofia</span>
+        {onBack && (
+          <button onClick={onBack} style={{
+            marginLeft: "auto",
+            background: "transparent", border: "none",
+            color: C.muted, fontSize: 13, cursor: "pointer", fontFamily: "inherit",
+          }}>
+            ← Home
+          </button>
+        )}
+      </header>
+
+      <div style={{ maxWidth: 760, margin: "0 auto", padding: "36px 24px 80px" }}>
+        {/* Page title */}
         <h1 style={{
           fontFamily: "'DM Serif Display', Georgia, serif",
-          fontSize: 30, fontWeight: 400, margin: "2px 0 6px",
+          fontSize: "clamp(26px, 4vw, 34px)",
+          fontWeight: 400,
+          color: C.text,
+          margin: "0 0 8px",
+          letterSpacing: "-0.3px",
         }}>Business plan</h1>
-        <p style={{ color: C.muted, fontSize: 14, margin: "0 0 24px", lineHeight: 1.5 }}>
-          Tell Sofia about your venture and who you’re applying to. You’ll see the executive
-          summary and market section free; the full plan unlocks with a subscription.
+        <p style={{ color: C.muted, fontSize: 15, margin: "0 0 28px", lineHeight: 1.6 }}>
+          Tell Sofia about your venture and who you're applying to. The executive summary and
+          market section are free; the full plan unlocks with a subscription.
         </p>
 
         {phase !== "done" && (
           <>
             {/* Grant picker */}
-            <div style={{ ...card, marginBottom: 16 }}>
-              <div style={{ ...label, marginBottom: 12 }}>Who is this for?</div>
+            <div style={{ ...cardStyle, marginBottom: 16 }}>
+              <div style={{ ...sectionLabel, marginBottom: 12 }}>Who is this for?</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                 {GRANTS.map(g => {
                   const active = g.id === grantId;
                   return (
                     <button key={g.id} onClick={() => setGrantId(g.id)} style={{
-                      textAlign: "left", background: active ? "rgba(184,154,104,0.1)" : C.bg,
-                      border: `1px solid ${active ? C.gold : C.border}`, borderRadius: 10,
-                      padding: "12px 14px", cursor: "pointer", fontFamily: "inherit",
+                      textAlign: "left",
+                      background: active ? C.goldLight : C.bg,
+                      border: `1.5px solid ${active ? C.gold : C.border}`,
+                      borderRadius: 10,
+                      padding: "12px 14px",
+                      cursor: "pointer",
+                      fontFamily: "inherit",
+                      transition: "border-color 0.15s, background 0.15s",
                     }}>
                       <div style={{ color: active ? C.gold : C.text, fontWeight: 600, fontSize: 14 }}>
                         {g.name}
@@ -311,7 +363,7 @@ export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
             </div>
 
             {/* Intake form */}
-            <div style={{ ...card, marginBottom: 16, display: "grid", gap: 14 }}>
+            <div style={{ ...cardStyle, marginBottom: 16, display: "grid", gap: 14 }}>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
                 <Field label="Business name" value={form.businessName}
                   onChange={set("businessName")} placeholder="e.g. Kano Logistics" />
@@ -336,13 +388,14 @@ export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
 
             {error && <ErrorCard message={error} onRetry={canGenerate ? generate : null} />}
 
-            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-              <button onClick={generate} disabled={!canGenerate || phase === "generating"}
-                style={btn(C.action, !canGenerate || phase === "generating")}>
-                {phase === "generating" ? <>Writing your plan<Ellipsis /></> : "Generate plan"}
-              </button>
-              <span style={{ fontSize: 12, color: C.muted }}>
-                {canGenerate ? "Preview is free · full plan uses 5 credits" : "Fill business name, industry, funding, and a short description"}
+            <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+              <PrimaryBtn onClick={generate} disabled={!canGenerate || phase === "generating"}>
+                {phase === "generating" ? <>Writing your plan<Dots /></> : "Generate plan"}
+              </PrimaryBtn>
+              <span style={{ fontSize: 13, color: C.muted }}>
+                {canGenerate
+                  ? "Preview is free · full plan uses 5 credits"
+                  : "Fill business name, industry, funding, and a description"}
               </span>
             </div>
           </>
@@ -352,17 +405,24 @@ export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
         {phase === "done" && resp && (
           <>
             <div style={{
-              ...card, marginBottom: 16,
-              display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16,
+              ...cardStyle,
+              background: C.goldLight,
+              borderColor: "rgba(184,154,104,0.4)",
+              marginBottom: 16,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 16,
             }}>
               <div>
-                <div style={{ ...label, marginBottom: 4 }}>{resp.grant}</div>
-                <div style={{ fontSize: 18, fontWeight: 600 }}>{form.businessName}</div>
+                <div style={{ ...sectionLabel, color: C.gold, marginBottom: 4 }}>{resp.grant}</div>
+                <div style={{ fontSize: 20, fontWeight: 600, color: C.text }}>{form.businessName}</div>
               </div>
               {!resp.paid && (
                 <div style={{
                   flexShrink: 0, fontSize: 12, color: C.gold,
-                  border: `1px solid ${C.gold}`, borderRadius: 999, padding: "6px 12px",
+                  border: `1px solid rgba(184,154,104,0.5)`,
+                  borderRadius: 999, padding: "6px 12px", background: C.bg,
                 }}>Free preview</div>
               )}
             </div>
@@ -371,15 +431,13 @@ export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
               {sectionKeys.map(key => {
                 const body = resp.data[key];
                 const isGated = resp.gated?.[key];
-                if (body == null && isGated) {
-                  return <LockedSection key={key} name={labelFor(key)} />;
-                }
+                if (body == null && isGated) return <LockedSection key={key} name={labelFor(key)} />;
                 if (body == null) return null;
                 return <TextSection key={key} name={labelFor(key)} body={body} />;
               })}
 
               {Array.isArray(fundsRows) && fundsRows.length > 0 && (
-                <FundsTable rows={fundsRows} ask={form.fundingAmount} warnings={resp.warnings} />
+                <FundsTable rows={fundsRows} warnings={resp.warnings} />
               )}
               {fundsRows == null && resp.gated?.useOfFunds && !resp.paid && (
                 <LockedSection name="Use of funds" />
@@ -388,24 +446,27 @@ export default function PlanApp({ backendUrl = "http://localhost:5000" }) {
 
             {!resp.paid && (
               <div style={{
-                ...card, marginTop: 16, textAlign: "center",
-                borderColor: "rgba(184,154,104,0.5)",
+                ...cardStyle,
+                marginTop: 16,
+                textAlign: "center",
+                borderColor: "rgba(184,154,104,0.4)",
+                background: C.goldLight,
               }}>
-                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>
+                <div style={{ fontSize: 16, fontWeight: 600, color: C.text, marginBottom: 6 }}>
                   Unlock the full plan
                 </div>
-                <div style={{ color: C.muted, fontSize: 14, marginBottom: 14 }}>
+                <div style={{ color: C.muted, fontSize: 14, marginBottom: 16 }}>
                   Financial projections, operations, and go-to-market are part of a subscription.
                 </div>
-                <button style={btn(C.action)} onClick={() => window.dispatchEvent(new CustomEvent("sofia:upgrade"))}>
+                <PrimaryBtn onClick={() => window.dispatchEvent(new CustomEvent("sofia:upgrade"))}>
                   See plans
-                </button>
+                </PrimaryBtn>
               </div>
             )}
 
-            <button onClick={resetAll} style={{ ...btn(C.border), color: C.text, marginTop: 20 }}>
-              Start a new plan
-            </button>
+            <div style={{ marginTop: 24 }}>
+              <SecondaryBtn onClick={resetAll}>Start a new plan</SecondaryBtn>
+            </div>
           </>
         )}
       </div>

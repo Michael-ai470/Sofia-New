@@ -1,9 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import SofiaApp from "./SofiaApp.jsx";
+import App from "./App.jsx";
+import "./index.css";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <SofiaApp backendUrl="http://localhost:5000" />
+    <App />
   </React.StrictMode>
 );
