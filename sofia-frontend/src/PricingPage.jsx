@@ -16,6 +16,14 @@ const C = {
   shadowFloat: "0 8px 24px rgba(26,26,46,.10)",
 };
 
+/* Free plan — display only, not purchasable */
+const FREE_PLAN = {
+  name: "Free",
+  usp: "Try 3 documents",
+  credits: 3,
+  price_ngn: 0,
+};
+
 const PLUS_PLANS = [
   {
     name: "Plus Telegram",
@@ -61,39 +69,6 @@ const PLUS_PLANS = [
   },
 ];
 
-/* ── Engine icons ── */
-function CvIcon() {
-  return (
-    <svg width="26" height="26" fill="none" viewBox="0 0 24 24"
-      stroke={C.indigo} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="4" y="3" width="16" height="18" rx="2" />
-      <path d="M8 8h8M8 12h5M8 16h6" />
-    </svg>
-  );
-}
-
-function RecruiterIcon() {
-  return (
-    <svg width="26" height="26" fill="none" viewBox="0 0 24 24"
-      stroke={C.indigo} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="9" cy="7" r="3" />
-      <circle cx="16" cy="7" r="3" />
-      <path d="M3 19c0-3.314 2.686-6 6-6s6 2.686 6 6" />
-      <path d="M16 13c2.21 0 4 1.79 4 4v2" />
-    </svg>
-  );
-}
-
-function PlanIcon() {
-  return (
-    <svg width="26" height="26" fill="none" viewBox="0 0 24 24"
-      stroke={C.indigo} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 2L20 7v10l-8 5-8-5V7l8-5z" />
-      <path d="M12 7v10M8.5 9.5l3.5 2.5 3.5-2.5" />
-    </svg>
-  );
-}
-
 function CheckMark() {
   return (
     <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
@@ -103,96 +78,7 @@ function CheckMark() {
   );
 }
 
-const ENGINES = [
-  {
-    id: "cv",
-    Icon: CvIcon,
-    name: "CV Builder",
-    sub: "Score, rewrite & cover letter",
-    desc: "Upload your CV and get a score, a full rewrite, a cover letter, and interview prep.",
-  },
-  {
-    id: "recruiter",
-    Icon: RecruiterIcon,
-    name: "Recruiter",
-    sub: "Rank a batch of CVs",
-    desc: "Upload 2–20 CVs against a role. Sofia ranks every candidate and explains the top three.",
-  },
-  {
-    id: "plan",
-    Icon: PlanIcon,
-    name: "Business Plan",
-    sub: "Grant-ready documents",
-    desc: "Fill a short form, pick a grant, and get a structured plan ready to take to funders.",
-  },
-];
-
-function EngineCard({ engine, onSelect }) {
-  const [hov, setHov] = useState(false);
-  const { Icon, name, sub, desc, id } = engine;
-
-  return (
-    <button
-      onClick={() => onSelect(id)}
-      onMouseEnter={() => setHov(true)}
-      onMouseLeave={() => setHov(false)}
-      style={{
-        display: "flex", flexDirection: "column", gap: 14,
-        padding: "24px 22px",
-        background: C.surface,
-        border: `${hov ? "2px" : "1.5px"} solid ${hov ? C.indigo : C.border}`,
-        borderRadius: 12,
-        cursor: "pointer", textAlign: "left",
-        transform: hov ? "translateY(-4px)" : "translateY(0)",
-        boxShadow: hov ? C.shadowFloat : C.shadow,
-        transition: "transform 0.18s ease, box-shadow 0.18s ease, border-color 0.15s",
-        fontFamily: "'DM Sans', system-ui, sans-serif",
-        width: "100%",
-      }}
-    >
-      <div style={{
-        width: 48, height: 48, borderRadius: 10,
-        background: hov ? C.indigoTint : "#F4F4F7",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        transition: "background 0.15s", flexShrink: 0,
-      }}>
-        <Icon />
-      </div>
-
-      <div>
-        <div style={{
-          fontFamily: "'Bricolage Grotesque', system-ui, sans-serif",
-          fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 3,
-        }}>
-          {name}
-        </div>
-        <div style={{ fontSize: 12, color: C.muted, fontWeight: 500 }}>{sub}</div>
-      </div>
-
-      <p style={{ margin: 0, fontSize: 13, color: C.muted, lineHeight: 1.65, flex: 1 }}>
-        {desc}
-      </p>
-
-      <div style={{
-        fontSize: 13, fontWeight: 600,
-        color: hov ? C.indigo : C.muted,
-        display: "flex", alignItems: "center", gap: 4,
-        transition: "color 0.15s",
-      }}>
-        Start
-        <span style={{
-          display: "inline-block",
-          transform: hov ? "translateX(4px)" : "translateX(0)",
-          transition: "transform 0.18s ease",
-        }}>
-          →
-        </span>
-      </div>
-    </button>
-  );
-}
-
-/* ── Free plan card ── */
+/* ─── Free plan card ────────────────────────────────────────────────── */
 function FreePlanCard({ onLogin }) {
   const [hov, setHov] = useState(false);
   return (
@@ -258,7 +144,7 @@ function FreePlanCard({ onLogin }) {
   );
 }
 
-/* ── Paid credit plan card ── */
+/* ─── Paid credit plan card ─────────────────────────────────────────── */
 function PlanCard({ pkg, currency, user, onBuy, onLogin }) {
   const [hov, setHov] = useState(false);
   const perCredit = fmtPrice(Math.round(pkg.price_ngn / pkg.credits), currency);
@@ -362,7 +248,7 @@ function PlanCard({ pkg, currency, user, onBuy, onLogin }) {
   );
 }
 
-/* ── Plus plan card ── */
+/* ─── Plus plan card ────────────────────────────────────────────────── */
 function PlusPlanCard({ plan }) {
   const [hov, setHov] = useState(false);
   return (
@@ -441,61 +327,24 @@ function PlusPlanCard({ plan }) {
   );
 }
 
-export default function LandingPage({ onSelect, user, currency, onBuy, onLogin }) {
+/* ─── Main page ─────────────────────────────────────────────────────── */
+export default function PricingPage({ user, currency, onBuy, onLogin }) {
   return (
-    <div style={{ minHeight: "calc(100vh - 60px)", display: "flex", flexDirection: "column", background: C.bg }}>
+    <div style={{ minHeight: "calc(100vh - 60px)", background: C.bg, fontFamily: "'DM Sans', system-ui, sans-serif" }}>
 
       {/* ── Hero ── */}
-      <section style={{
-        textAlign: "center",
-        padding: "clamp(48px, 8vw, 88px) 24px 36px",
-        maxWidth: 640, margin: "0 auto", width: "100%",
-      }}>
-        <h1 style={{
-          fontFamily: "'Bricolage Grotesque', system-ui, sans-serif",
-          fontSize: "clamp(32px, 5.5vw, 54px)",
-          fontWeight: 800, lineHeight: 1.1,
-          color: C.text, margin: "0 0 20px",
-          letterSpacing: "-0.03em",
-        }}>
-          Career tools built for{" "}
-          <span style={{ color: C.indigo }}>Professionals.</span>
-        </h1>
-        <p style={{
-          fontSize: "clamp(15px, 2vw, 17px)",
-          color: C.muted, margin: 0, lineHeight: 1.65,
-          maxWidth: 460, marginLeft: "auto", marginRight: "auto",
-        }}>
-          Sharpen your CV, rank your candidates, and write a fundable business plan —
-          each one finished with AI, in minutes, not weeks.
-        </p>
-      </section>
-
-      {/* ── Engine cards ── */}
-      <section style={{
-        maxWidth: 1040, margin: "0 auto",
-        padding: "0 24px 72px", width: "100%",
-      }}>
-        <div className="engine-grid" style={{ display: "grid", gap: 16 }}>
-          {ENGINES.map(e => (
-            <EngineCard key={e.id} engine={e} onSelect={onSelect} />
-          ))}
-        </div>
-      </section>
-
-      {/* ── Pricing intro ── */}
-      <section style={{ textAlign: "center", padding: "clamp(32px, 5vw, 56px) 24px 44px", borderTop: `1px solid ${C.border}` }}>
+      <section style={{ textAlign: "center", padding: "clamp(40px, 6vw, 72px) 24px 44px" }}>
         <div style={{
           fontSize: 11, fontWeight: 700, letterSpacing: "0.1em",
           textTransform: "uppercase", color: C.indigo, opacity: 0.7, marginBottom: 14,
         }}>Pricing</div>
-        <h2 style={{
+        <h1 style={{
           fontFamily: "'Bricolage Grotesque', system-ui, sans-serif",
-          fontSize: "clamp(26px, 4vw, 38px)", fontWeight: 800,
+          fontSize: "clamp(28px, 4.5vw, 42px)", fontWeight: 800,
           lineHeight: 1.1, color: C.text, margin: "0 0 16px", letterSpacing: "-0.03em",
         }}>
           One credit, one document.
-        </h2>
+        </h1>
         <p style={{ fontSize: 16, color: C.muted, margin: 0, lineHeight: 1.65, maxWidth: 520, marginLeft: "auto", marginRight: "auto" }}>
           Every CV rewrite, candidate ranking, or business plan costs one credit.
           Buy a pack, then add Sofia Plus for daily job alerts.
@@ -503,7 +352,7 @@ export default function LandingPage({ onSelect, user, currency, onBuy, onLogin }
       </section>
 
       {/* ── Credit plan cards ── */}
-      <section style={{ maxWidth: 900, margin: "0 auto", padding: "0 24px 64px", width: "100%" }}>
+      <section style={{ maxWidth: 900, margin: "0 auto", padding: "0 24px 64px" }}>
         <div style={{ fontSize: 17, fontWeight: 600, color: C.text, marginBottom: 20, fontFamily: "'Bricolage Grotesque', system-ui, sans-serif" }}>
           Credit plans
         </div>
@@ -516,7 +365,7 @@ export default function LandingPage({ onSelect, user, currency, onBuy, onLogin }
       </section>
 
       {/* ── Sofia Plus ── */}
-      <section style={{ maxWidth: 900, margin: "0 auto", padding: "0 24px 72px", width: "100%" }}>
+      <section style={{ maxWidth: 900, margin: "0 auto", padding: "0 24px 72px" }}>
         <div style={{ fontSize: 17, fontWeight: 600, color: C.text, marginBottom: 4, fontFamily: "'Bricolage Grotesque', system-ui, sans-serif" }}>
           Sofia Plus — personalised job alerts{" "}
           <span style={{ fontWeight: 400, color: C.muted, fontSize: 13, fontFamily: "'DM Sans', system-ui, sans-serif" }}>
@@ -530,6 +379,7 @@ export default function LandingPage({ onSelect, user, currency, onBuy, onLogin }
           className="plus-pitch-grid"
           style={{ background: C.indigo, borderRadius: 12, padding: "clamp(24px, 4vw, 40px)", marginBottom: 16 }}
         >
+          {/* Left: headline + lead */}
           <div>
             <div style={{
               fontSize: 11, fontWeight: 700, letterSpacing: "0.08em",
@@ -551,6 +401,7 @@ export default function LandingPage({ onSelect, user, currency, onBuy, onLogin }
             </p>
           </div>
 
+          {/* Right: 3 bullet points */}
           <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
             {[
               {
@@ -612,32 +463,6 @@ export default function LandingPage({ onSelect, user, currency, onBuy, onLogin }
           </div>
         ))}
       </section>
-
-      {/* ── Footer ── */}
-      <footer style={{
-        marginTop: "auto",
-        borderTop: `1px solid ${C.border}`,
-        padding: "18px 24px",
-        display: "flex", flexWrap: "wrap",
-        alignItems: "center", justifyContent: "space-between",
-        gap: 12,
-      }}>
-        <span style={{ fontSize: 12, color: C.muted }}>
-          © 2026 Sofia. All rights reserved.
-        </span>
-        <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
-          {["Terms", "Privacy", "Return Policy", "Contact"].map(l => (
-            <a
-              key={l} href="#"
-              style={{ fontSize: 12, color: C.muted, transition: "color 0.15s" }}
-              onMouseEnter={e => (e.currentTarget.style.color = C.indigo)}
-              onMouseLeave={e => (e.currentTarget.style.color = C.muted)}
-            >
-              {l}
-            </a>
-          ))}
-        </div>
-      </footer>
     </div>
   );
 }

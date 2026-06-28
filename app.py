@@ -2,25 +2,41 @@
 app.py — Flask backend for Sofia, the career & business document platform.
 
 Routes:
-    POST /extract-text      PDF/Word -> plain text (no AI, saves tokens)
-    POST /analyse-cv        Stage 1 analysis (Haiku)
-    POST /rewrite-cv        Stage 2 rewrite (Sonnet)
-    POST /cover-letter      Stage 3 cover letter (Sonnet)
-    POST /rank-cvs          Engine 2 recruiter ranking (Sonnet)
-    POST /generate-plan     Engine 3 business plan (Sonnet)
-    POST /generate-pdfs     ReportLab PDFs (no AI)
-    POST /generate-docx     python-docx Word files (no AI)
+    POST /extract-text              PDF/Word -> plain text (no AI, saves tokens)
+    POST /analyse-cv                Stage 1 analysis (Haiku)
+    POST /rewrite-cv                Stage 2 rewrite (Sonnet)
+    POST /cover-letter              Stage 3 cover letter (Sonnet)
+    POST /rank-cvs                  Engine 2 recruiter ranking (Sonnet)
+    POST /generate-plan             Engine 3 business plan (Sonnet)
+    POST /generate-pdfs             ReportLab PDFs (no AI)
+    POST /generate-docx             python-docx Word files (no AI)
     GET  /health
 
+    POST /auth/signup               Create account, return JWT
+    POST /auth/login                Verify credentials, return JWT
+    GET  /auth/me                   Return user profile + live credit balance
+
+    GET  /credits/packages          List credit packages with currency conversion
+    POST /credits/initiate          Initiate Paystack or Monnify payment
+    POST /credits/verify            Verify payment callback, grant credits
+    POST /credits/webhook/paystack  Paystack server-to-server webhook
+    POST /credits/webhook/monnify   Monnify server-to-server webhook
+
 Run:
-    pip install flask flask-cors reportlab python-docx pdfplumber anthropic python-dotenv
+    pip install -r requirements.txt
     python app.py
 
 Environment (.env):
     ANTHROPIC_API_KEY=sk-ant-...        (required)
-    SOFIA_ALLOWED_ORIGINS=http://localhost:3000   (comma-separated; default '*')
+    JWT_SECRET=<random hex>             (required — generate with secrets.token_hex(32))
+    DATABASE_URL=postgresql://...       (required for auth + credits)
+    SOFIA_ALLOWED_ORIGINS=http://localhost:5173   (comma-separated; default '*')
     SOFIA_DEBUG=0                       (1 enables Flask debug — never in production)
     SOFIA_MAX_UPLOAD_MB=8               (max upload size)
+    PAYSTACK_SECRET_KEY=sk_live_...     (required for Paystack payments)
+    MONNIFY_API_KEY=...                 (required for Monnify payments)
+    MONNIFY_SECRET_KEY=...              (required for Monnify payments)
+    MONNIFY_CONTRACT_CODE=...           (required for Monnify payments)
 """
 
 import base64
@@ -164,18 +180,20 @@ class CreditError(Exception):
 
 
 def lookup_user(token):
-    """STUB. Return a user dict or None. Replace with a real lookup."""
-    # Example shape: {"id": "...", "tier": "pro", "credits": 100, "unlimited": False}
-    return None
+    """Decode the JWT and return the user from the database, or None."""
+    from auth import lookup_user as _auth_lookup
+    return _auth_lookup(token)
 
 
 def charge_credits(user, amount):
-    """STUB. Deduct credits. Replace with an atomic datastore update."""
+    """Atomically deduct credits from the database. Raises CreditError on failure."""
     if user is None or user.get("unlimited"):
         return
-    if user.get("credits", 0) < amount:
-        raise CreditError("Insufficient credits for this action.")
-    user["credits"] -= amount
+    from db import deduct_credits as _deduct, CreditError as _DbCreditError
+    try:
+        _deduct(str(user["id"]), amount, reason=request.path.lstrip("/"))
+    except _DbCreditError as e:
+        raise CreditError(str(e), status=e.status)
 
 
 def require_credits(amount):
@@ -1721,5 +1739,35 @@ def health():
     })
 
 
+# --------------------------------------------------------------------------- #
+#  AUTH ROUTES                                                                 #
+# --------------------------------------------------------------------------- #
+from auth import signup, login, get_me  # noqa: E402
+
+app.add_url_rule("/auth/signup", view_func=signup, methods=["POST"])
+app.add_url_rule("/auth/login",  view_func=login,  methods=["POST"])
+app.add_url_rule("/auth/me",     view_func=get_me, methods=["GET"])
+
+
+# --------------------------------------------------------------------------- #
+#  PAYMENT ROUTES                                                              #
+# --------------------------------------------------------------------------- #
+from Payment import (  # noqa: E402
+    get_packages, initiate_payment, verify_payment,
+    paystack_webhook, monnify_webhook,
+)
+
+app.add_url_rule("/credits/packages",         view_func=get_packages,     methods=["GET"])
+app.add_url_rule("/credits/initiate",         view_func=initiate_payment, methods=["POST"])
+app.add_url_rule("/credits/verify",           view_func=verify_payment,   methods=["POST"])
+app.add_url_rule("/credits/webhook/paystack", view_func=paystack_webhook, methods=["POST"])
+app.add_url_rule("/credits/webhook/monnify",  view_func=monnify_webhook,  methods=["POST"])
+
+
 if __name__ == "__main__":
+    try:
+        from db import init_db
+        init_db()
+    except Exception as _db_err:
+        log.warning("Database not reachable at startup (auth/credits will fail until connected): %s", _db_err)
     app.run(host="0.0.0.0", port=5000, debug=DEBUG_MODE)
