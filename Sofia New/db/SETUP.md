@@ -55,7 +55,7 @@ running (`sudo systemctl status postgresql`) and that the password matches.
 
 ```bash
 # From the sofia/ project root
-cp .env.example .env
+cp .env .env
 ```
 
 Open `.env` and set:

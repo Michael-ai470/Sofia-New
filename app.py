@@ -7,9 +7,9 @@ Routes:
     POST /rewrite-cv                Stage 2 rewrite (Sonnet)
     POST /cover-letter              Stage 3 cover letter (Sonnet)
     POST /rank-cvs                  Engine 2 recruiter ranking (Sonnet)
-    POST /generate-plan             Engine 3 business plan (Sonnet)
+    POST /generate-plan              Engine 3 business plan (Sonnet)
     POST /generate-pdfs             ReportLab PDFs (no AI)
-    POST /generate-docx             python-docx Word files (no AI)
+    POST /generate-docx              python-docx Word files (no AI)
     GET  /health
 
     POST /auth/signup               Create account, return JWT
@@ -27,7 +27,9 @@ Run:
     python app.py
 
 Environment (.env):
-    ANTHROPIC_API_KEY=sk-ant-...        (required)
+    QWEN_API_KEY=sk-...                 (required — DashScope API key)
+    QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1  (optional override; use
+                                          https://dashscope.aliyuncs.com/compatible-mode/v1 for mainland China)
     JWT_SECRET=<random hex>             (required — generate with secrets.token_hex(32))
     DATABASE_URL=postgresql://...       (required for auth + credits)
     SOFIA_ALLOWED_ORIGINS=http://localhost:5173   (comma-separated; default '*')
@@ -52,7 +54,7 @@ from functools import wraps
 from logging.handlers import RotatingFileHandler
 from threading import Lock
 
-import anthropic
+from openai import OpenAI
 import pdfplumber
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
@@ -122,7 +124,8 @@ except ImportError:
 DEBUG_MODE     = os.environ.get("SOFIA_DEBUG", "0") == "1"
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("SOFIA_ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 MAX_UPLOAD_MB  = int(os.environ.get("SOFIA_MAX_UPLOAD_MB", "8"))
-API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+API_KEY        = os.environ.get("QWEN_API_KEY", "").strip()
+QWEN_BASE_URL  = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").strip()
 
 # Hard input caps (characters) to bound token cost and block abuse (A6).
 MAX_CV_CHARS  = 30_000
@@ -144,16 +147,19 @@ if SOFIA_ENV == "production":
         raise SystemExit("FATAL: SOFIA_ALLOWED_ORIGINS=* is not allowed in production. "
                          "Set it to your frontend domain.")
     if not API_KEY:
-        raise SystemExit("FATAL: ANTHROPIC_API_KEY is not set in production.")
+        raise SystemExit("FATAL: QWEN_API_KEY is not set in production.")
 
 if not API_KEY:
     # Fail loud rather than booting a server whose every AI route 500s (A2).
-    log.warning("ANTHROPIC_API_KEY is not set. AI routes will be unavailable until it is.")
+    log.warning("QWEN_API_KEY is not set. AI routes will be unavailable until it is.")
 
-_anthropic = anthropic.Anthropic(api_key=API_KEY) if API_KEY else None
+_qwen = OpenAI(api_key=API_KEY, base_url=QWEN_BASE_URL) if API_KEY else None
 
-HAIKU_MODEL  = "claude-haiku-4-5"
-SONNET_MODEL = "claude-sonnet-4-6"
+# Qwen model tiers, standing in for the old Haiku (cheap/fast Stage 1) and
+# Sonnet (higher-quality Stage 2/3, ranking, plan) roles. Adjust to taste —
+# qwen-turbo/qwen-plus/qwen-max is the usual cost/quality ladder.
+HAIKU_MODEL  = "qwen-turbo"
+SONNET_MODEL = "qwen-max"
 
 # --------------------------------------------------------------------------- #
 #  CREDIT / AUTH SCAFFOLDING  (ADDITION — see audit note)                      #
@@ -615,20 +621,40 @@ def rules_engine(cv_text: str) -> dict:
 # --------------------------------------------------------------------------- #
 def call_claude(model: str, system: str, user: str, max_tokens: int):
     """
-    Call Anthropic with prompt caching on the (now large, static) system prompt.
-    Returns (text, stop_reason). Raises RuntimeError if the client is unconfigured.
+    Call Qwen (DashScope's OpenAI-compatible endpoint). Name kept as `call_claude`
+    so every call site below (ai_json, etc.) needed no further changes.
+    Returns (text, stop_reason) where stop_reason mirrors Anthropic's vocabulary
+    ("max_tokens" on truncation) so downstream checks keep working unmodified.
+
+    Two Qwen/DashScope-specific things this depends on:
+    - response_format json_object: Qwen does not reliably self-restrict to JSON
+      from prompt instructions alone the way Claude does; DashScope requires this
+      flag AND requires the word "json" to appear somewhere in the messages
+      (our system prompts already say "JSON", so this is satisfied).
+    - enable_thinking: false: "thinking" mode models do not support structured
+      JSON output at all on DashScope, so thinking must be explicitly disabled.
+
+    Note: DashScope handles context caching for repeated system prompts
+    automatically server-side — there's no separate cache_control flag to set,
+    unlike the old Anthropic call.
     """
-    if _anthropic is None:
-        raise RuntimeError("AI is unavailable: ANTHROPIC_API_KEY is not configured.")
-    response = _anthropic.messages.create(
+    if _qwen is None:
+        raise RuntimeError("AI is unavailable: QWEN_API_KEY is not configured.")
+    response = _qwen.chat.completions.create(
         model=model,
         max_tokens=max_tokens,
-        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        extra_body={"enable_thinking": False},
         timeout=120,
     )
-    text = "".join(b.text for b in response.content if b.type == "text")
-    return text, response.stop_reason
+    choice = response.choices[0]
+    text = choice.message.content or ""
+    stop_reason = "max_tokens" if choice.finish_reason == "length" else choice.finish_reason
+    return text, stop_reason
 
 
 def parse_json(raw: str) -> dict:
@@ -657,10 +683,11 @@ def ai_json(model, system, user, max_tokens):
             return parse_json(text)
         except (json.JSONDecodeError, ValueError) as e:
             last_err = "The model returned output that was not valid JSON."
+            preview = (text or "")[:500].replace("\n", "\\n")
             if attempt == 0:
-                log.warning("ai_json parse failed model=%s attempt=1 — retrying: %s", model, e)
+                log.warning("ai_json parse failed model=%s attempt=1 — retrying: %s | raw preview: %s", model, e, preview)
             else:
-                log.error("ai_json parse failed model=%s attempt=2 — giving up: %s", model, e)
+                log.error("ai_json parse failed model=%s attempt=2 — giving up: %s | raw preview: %s", model, e, preview)
     raise ValueError(last_err or "The model returned malformed output.")
 
 
@@ -1646,16 +1673,126 @@ def split_name(full):
 
 
 # --------------------------------------------------------------------------- #
+#  AI-OUTPUT NORMALIZATION                                                     #
+#  Claude reliably matched the requested JSON shape; Qwen sometimes doesn't    #
+#  (a string where a list was expected, null where [] was expected, a missing #
+#  nested key, etc). These helpers coerce whatever comes back into exactly    #
+#  the shape build_cv_pdf_a/b and build_cv_docx expect, so malformed AI       #
+#  output degrades to blank fields instead of throwing a 500.                 #
+# --------------------------------------------------------------------------- #
+def _as_str(v):
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else str(v)
+
+
+def _as_str_list(v):
+    if not v:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, list):
+        return [_as_str(x) for x in v if x]
+    return []
+
+
+def _as_dict_list(v, keys):
+    """Coerce into a list of dicts each having exactly `keys` as string fields."""
+    if not v:
+        return []
+    if isinstance(v, dict):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    out = []
+    for item in v:
+        if isinstance(item, dict):
+            out.append({k: _as_str(item.get(k)) for k in keys})
+        elif isinstance(item, str) and item.strip():
+            d = {k: "" for k in keys}
+            d[keys[0]] = item
+            out.append(d)
+    return out
+
+
+def normalize_cv(cv: dict) -> dict:
+    cv = cv if isinstance(cv, dict) else {}
+    str_fields = ["fullText", "header", "summary", "experience", "skills", "education",
+                  "certifications", "candidateName", "candidateEmail", "candidatePhone",
+                  "candidateLinkedIn", "candidateWebsite", "candidateLocation",
+                  "titleLine", "companyName"]
+    return {k: _as_str(cv.get(k)) for k in str_fields}
+
+
+def normalize_pdf_data(pdf_data: dict) -> dict:
+    pdf_data = pdf_data if isinstance(pdf_data, dict) else {}
+
+    raw_items = pdf_data.get("experienceItems")
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        raw_items = []
+    exp_out = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        exp_out.append({
+            "role": _as_str(item.get("role")),
+            "company": _as_str(item.get("company")),
+            "location": _as_str(item.get("location")),
+            "dates": _as_str(item.get("dates")),
+            "bullets": _as_str_list(item.get("bullets")),
+        })
+
+    return {
+        "expertise": _as_str_list(pdf_data.get("expertise")),
+        "tools": _as_str_list(pdf_data.get("tools")),
+        "education": _as_dict_list(pdf_data.get("education"), ["degree", "school", "years"]),
+        "certifications": _as_dict_list(pdf_data.get("certifications"), ["name", "org"]),
+        "projects": _as_str_list(pdf_data.get("projects")),
+        "experienceItems": exp_out,
+    }
+
+
+def normalize_letter(letter: dict) -> dict:
+    letter = letter if isinstance(letter, dict) else {}
+    fields = ["opening", "body1", "body2", "body3Remote", "closing",
+              "fullText", "signoffName", "tagline"]
+    return {k: _as_str(letter.get(k)) for k in fields}
+
+
+def normalize_prep(prep: dict) -> dict:
+    prep = prep if isinstance(prep, dict) else {}
+    raw_qs = prep.get("questions")
+    if not isinstance(raw_qs, list):
+        raw_qs = []
+    out_qs = []
+    for q in raw_qs:
+        if not isinstance(q, dict):
+            continue
+        star = q.get("starAnswer")
+        if not isinstance(star, dict):
+            star = {}
+        out_qs.append({
+            "question": _as_str(q.get("question")),
+            "weakness": _as_str(q.get("weakness")),
+            "starAnswer": {k: _as_str(star.get(k)) for k in ["situation", "task", "action", "result"]},
+            "needsRealExample": bool(q.get("needsRealExample")),
+        })
+    return {"questions": out_qs}
+
+
+# --------------------------------------------------------------------------- #
 #  ROUTE — GENERATE PDFs                                                      #
 # --------------------------------------------------------------------------- #
 @app.route("/generate-pdfs", methods=["POST"])
 def generate_pdfs():
     try:
         data = request.get_json(force=True) or {}
-        cv = data.get("rewrittenCV") or {}
-        pdf_data = data.get("pdfData") or {}
-        letter = data.get("coverLetter") or {}
-        prep = data.get("interviewPrep") or {}
+        cv = normalize_cv(data.get("rewrittenCV"))
+        pdf_data = normalize_pdf_data(data.get("pdfData"))
+        letter = normalize_letter(data.get("coverLetter")) if data.get("coverLetter") else {}
+        prep = normalize_prep(data.get("interviewPrep")) if data.get("interviewPrep") else {}
         company = data.get("companyName") or cv.get("companyName") or "Company"
         date_str = data.get("dateStr") or ""
         salutation = data.get("salutation") or "Dear Hiring Manager,"
@@ -1692,10 +1829,10 @@ def generate_pdfs():
 def generate_docx():
     try:
         data = request.get_json(force=True) or {}
-        cv = data.get("rewrittenCV") or {}
-        pdf_data = data.get("pdfData") or {}
-        letter = data.get("coverLetter") or {}
-        prep = data.get("interviewPrep") or {}
+        cv = normalize_cv(data.get("rewrittenCV"))
+        pdf_data = normalize_pdf_data(data.get("pdfData"))
+        letter = normalize_letter(data.get("coverLetter")) if data.get("coverLetter") else {}
+        prep = normalize_prep(data.get("interviewPrep")) if data.get("interviewPrep") else {}
         company = data.get("companyName") or cv.get("companyName") or "Company"
         date_str = data.get("dateStr") or ""
         salutation = data.get("salutation") or "Dear Hiring Manager,"
@@ -1733,7 +1870,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "Sofia",
-        "aiConfigured": _anthropic is not None,
+        "aiConfigured": _qwen is not None,
         "creditsEnforced": ENFORCE_CREDITS,
         "fonts": _REGISTERED,
     })
