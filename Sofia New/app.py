@@ -2,25 +2,43 @@
 app.py — Flask backend for Sofia, the career & business document platform.
 
 Routes:
-    POST /extract-text      PDF/Word -> plain text (no AI, saves tokens)
-    POST /analyse-cv        Stage 1 analysis (Haiku)
-    POST /rewrite-cv        Stage 2 rewrite (Sonnet)
-    POST /cover-letter      Stage 3 cover letter (Sonnet)
-    POST /rank-cvs          Engine 2 recruiter ranking (Sonnet)
-    POST /generate-plan     Engine 3 business plan (Sonnet)
-    POST /generate-pdfs     ReportLab PDFs (no AI)
-    POST /generate-docx     python-docx Word files (no AI)
+    POST /extract-text              PDF/Word -> plain text (no AI, saves tokens)
+    POST /analyse-cv                Stage 1 analysis (Haiku)
+    POST /rewrite-cv                Stage 2 rewrite (Sonnet)
+    POST /cover-letter              Stage 3 cover letter (Sonnet)
+    POST /rank-cvs                  Engine 2 recruiter ranking (Sonnet)
+    POST /generate-plan              Engine 3 business plan (Sonnet)
+    POST /generate-pdfs             ReportLab PDFs (no AI)
+    POST /generate-docx              python-docx Word files (no AI)
     GET  /health
 
+    POST /auth/signup               Create account, return JWT
+    POST /auth/login                Verify credentials, return JWT
+    GET  /auth/me                   Return user profile + live credit balance
+
+    GET  /credits/packages          List credit packages with currency conversion
+    POST /credits/initiate          Initiate Paystack or Monnify payment
+    POST /credits/verify            Verify payment callback, grant credits
+    POST /credits/webhook/paystack  Paystack server-to-server webhook
+    POST /credits/webhook/monnify   Monnify server-to-server webhook
+
 Run:
-    pip install flask flask-cors reportlab python-docx pdfplumber anthropic python-dotenv
+    pip install -r requirements.txt
     python app.py
 
 Environment (.env):
-    ANTHROPIC_API_KEY=sk-ant-...        (required)
-    SOFIA_ALLOWED_ORIGINS=http://localhost:3000   (comma-separated; default '*')
+    QWEN_API_KEY=sk-...                 (required — DashScope API key)
+    QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1  (optional override; use
+                                          https://dashscope.aliyuncs.com/compatible-mode/v1 for mainland China)
+    JWT_SECRET=<random hex>             (required — generate with secrets.token_hex(32))
+    DATABASE_URL=postgresql://...       (required for auth + credits)
+    SOFIA_ALLOWED_ORIGINS=http://localhost:5173   (comma-separated; default '*')
     SOFIA_DEBUG=0                       (1 enables Flask debug — never in production)
     SOFIA_MAX_UPLOAD_MB=8               (max upload size)
+    PAYSTACK_SECRET_KEY=sk_live_...     (required for Paystack payments)
+    MONNIFY_API_KEY=...                 (required for Monnify payments)
+    MONNIFY_SECRET_KEY=...              (required for Monnify payments)
+    MONNIFY_CONTRACT_CODE=...           (required for Monnify payments)
 """
 
 import base64
@@ -29,9 +47,14 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
+from collections import defaultdict
+from functools import wraps
+from logging.handlers import RotatingFileHandler
+from threading import Lock
 
-import anthropic
+from openai import OpenAI
 import pdfplumber
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
@@ -48,8 +71,52 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 load_dotenv()
 
+# --------------------------------------------------------------------------- #
+#  LOGGING                                                                     #
+# --------------------------------------------------------------------------- #
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sofia")
+
+
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per line — easy to tail, parse, and forward."""
+    def format(self, record):
+        doc = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            doc["exc"] = self.formatException(record.exc_info)
+        return json.dumps(doc)
+
+
+_fh = RotatingFileHandler("sofia.log", maxBytes=5 * 1024 * 1024, backupCount=3)
+_fh.setLevel(logging.WARNING)
+_fh.setFormatter(_JsonFormatter())
+logging.getLogger().addHandler(_fh)
+
+# Optional Sentry — activates when SENTRY_DSN env var is set.
+# To enable: pip install sentry-sdk[flask]  and set SENTRY_DSN=https://...@sentry.io/...
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.flask import FlaskIntegration
+    from sentry_sdk.integrations.logging import LoggingIntegration as _SentryLogging
+
+    _SENTRY_DSN = os.environ.get("SENTRY_DSN", "").strip()
+    if _SENTRY_DSN:
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            integrations=[
+                FlaskIntegration(),
+                _SentryLogging(level=logging.WARNING, event_level=logging.ERROR),
+            ],
+            traces_sample_rate=0.1,
+            environment=os.environ.get("SOFIA_ENV", "development"),
+        )
+        log.info("Sentry active (env=%s)", os.environ.get("SOFIA_ENV", "development"))
+except ImportError:
+    pass  # sentry-sdk not installed; pip install sentry-sdk[flask] when deploying
 
 # --------------------------------------------------------------------------- #
 #  CONFIG                                                                      #
@@ -57,7 +124,8 @@ log = logging.getLogger("sofia")
 DEBUG_MODE     = os.environ.get("SOFIA_DEBUG", "0") == "1"
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("SOFIA_ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 MAX_UPLOAD_MB  = int(os.environ.get("SOFIA_MAX_UPLOAD_MB", "8"))
-API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+API_KEY        = os.environ.get("QWEN_API_KEY", "").strip()
+QWEN_BASE_URL  = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").strip()
 
 # Hard input caps (characters) to bound token cost and block abuse (A6).
 MAX_CV_CHARS  = 30_000
@@ -69,14 +137,29 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 CORS(app, origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else "*")
 
+SOFIA_ENV = os.environ.get("SOFIA_ENV", "development").strip()
+
+# Production safety guard — refuse to start with unsafe defaults.
+if SOFIA_ENV == "production":
+    if DEBUG_MODE:
+        raise SystemExit("FATAL: SOFIA_DEBUG=1 is not allowed in production.")
+    if ALLOWED_ORIGINS == ["*"]:
+        raise SystemExit("FATAL: SOFIA_ALLOWED_ORIGINS=* is not allowed in production. "
+                         "Set it to your frontend domain.")
+    if not API_KEY:
+        raise SystemExit("FATAL: QWEN_API_KEY is not set in production.")
+
 if not API_KEY:
     # Fail loud rather than booting a server whose every AI route 500s (A2).
-    log.warning("ANTHROPIC_API_KEY is not set. AI routes will be unavailable until it is.")
+    log.warning("QWEN_API_KEY is not set. AI routes will be unavailable until it is.")
 
-_anthropic = anthropic.Anthropic(api_key=API_KEY) if API_KEY else None
+_qwen = OpenAI(api_key=API_KEY, base_url=QWEN_BASE_URL) if API_KEY else None
 
-HAIKU_MODEL  = "claude-haiku-4-5"
-SONNET_MODEL = "claude-sonnet-4-6"
+# Qwen model tiers, standing in for the old Haiku (cheap/fast Stage 1) and
+# Sonnet (higher-quality Stage 2/3, ranking, plan) roles. Adjust to taste —
+# qwen-turbo/qwen-plus/qwen-max is the usual cost/quality ladder.
+HAIKU_MODEL  = "qwen-turbo"
+SONNET_MODEL = "qwen-max"
 
 # --------------------------------------------------------------------------- #
 #  CREDIT / AUTH SCAFFOLDING  (ADDITION — see audit note)                      #
@@ -160,6 +243,47 @@ def fail(message, status=500, exc=None):
 def too_large(_e):
     return jsonify({"status": "error",
                     "message": f"File exceeds the {MAX_UPLOAD_MB} MB limit."}), 413
+
+
+# --------------------------------------------------------------------------- #
+#  RATE LIMITING (sliding window per IP — no external dependency)             #
+#  Switch key from request.remote_addr to user ID once auth exists.           #
+# --------------------------------------------------------------------------- #
+_rl_store: dict = defaultdict(list)
+_rl_lock = Lock()
+
+
+def rate_limit(calls: int, window: int):
+    """Allow at most `calls` requests per `window` seconds per client IP."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            ip = request.remote_addr or "unknown"
+            key = f"{f.__name__}:{ip}"
+            now = time.time()
+            cutoff = now - window
+            with _rl_lock:
+                timestamps = [t for t in _rl_store[key] if t > cutoff]
+                if len(timestamps) >= calls:
+                    err_id = uuid.uuid4().hex[:12]
+                    log.warning("rate_limit_exceeded error_id=%s route=%s ip=%s",
+                                err_id, f.__name__, ip)
+                    return jsonify({
+                        "status": "error",
+                        "message": "Too many requests. Please wait a moment and try again.",
+                        "errorId": err_id,
+                    }), 429
+                timestamps.append(now)
+                _rl_store[key] = timestamps
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+@app.errorhandler(429)
+def rate_limited(_e):
+    return jsonify({"status": "error",
+                    "message": "Too many requests. Please wait a moment and try again."}), 429
 
 
 # --------------------------------------------------------------------------- #
@@ -497,20 +621,40 @@ def rules_engine(cv_text: str) -> dict:
 # --------------------------------------------------------------------------- #
 def call_claude(model: str, system: str, user: str, max_tokens: int):
     """
-    Call Anthropic with prompt caching on the (now large, static) system prompt.
-    Returns (text, stop_reason). Raises RuntimeError if the client is unconfigured.
+    Call Qwen (DashScope's OpenAI-compatible endpoint). Name kept as `call_claude`
+    so every call site below (ai_json, etc.) needed no further changes.
+    Returns (text, stop_reason) where stop_reason mirrors Anthropic's vocabulary
+    ("max_tokens" on truncation) so downstream checks keep working unmodified.
+
+    Two Qwen/DashScope-specific things this depends on:
+    - response_format json_object: Qwen does not reliably self-restrict to JSON
+      from prompt instructions alone the way Claude does; DashScope requires this
+      flag AND requires the word "json" to appear somewhere in the messages
+      (our system prompts already say "JSON", so this is satisfied).
+    - enable_thinking: false: "thinking" mode models do not support structured
+      JSON output at all on DashScope, so thinking must be explicitly disabled.
+
+    Note: DashScope handles context caching for repeated system prompts
+    automatically server-side — there's no separate cache_control flag to set,
+    unlike the old Anthropic call.
     """
-    if _anthropic is None:
-        raise RuntimeError("AI is unavailable: ANTHROPIC_API_KEY is not configured.")
-    response = _anthropic.messages.create(
+    if _qwen is None:
+        raise RuntimeError("AI is unavailable: QWEN_API_KEY is not configured.")
+    response = _qwen.chat.completions.create(
         model=model,
         max_tokens=max_tokens,
-        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        extra_body={"enable_thinking": False},
         timeout=120,
     )
-    text = "".join(b.text for b in response.content if b.type == "text")
-    return text, response.stop_reason
+    choice = response.choices[0]
+    text = choice.message.content or ""
+    stop_reason = "max_tokens" if choice.finish_reason == "length" else choice.finish_reason
+    return text, stop_reason
 
 
 def parse_json(raw: str) -> dict:
@@ -534,12 +678,16 @@ def ai_json(model, system, user, max_tokens):
         text, stop = call_claude(model, system, user, max_tokens)
         if stop == "max_tokens":
             last_err = "The model response was cut off (max_tokens). Try a shorter input."
-            # Still attempt a parse — partial objects sometimes parse after trimming.
+            log.warning("ai_json max_tokens model=%s attempt=%d — output truncated", model, attempt + 1)
         try:
             return parse_json(text)
         except (json.JSONDecodeError, ValueError) as e:
             last_err = "The model returned output that was not valid JSON."
-            log.warning("JSON parse failed (attempt %d): %s", attempt + 1, e)
+            preview = (text or "")[:500].replace("\n", "\\n")
+            if attempt == 0:
+                log.warning("ai_json parse failed model=%s attempt=1 — retrying: %s | raw preview: %s", model, e, preview)
+            else:
+                log.error("ai_json parse failed model=%s attempt=2 — giving up: %s | raw preview: %s", model, e, preview)
     raise ValueError(last_err or "The model returned malformed output.")
 
 
@@ -580,16 +728,37 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 
 def extract_docx_text(file_bytes: bytes) -> str:
+    from docx.oxml.ns import qn
     doc = Document(io.BytesIO(file_bytes))
     lines = []
-    for para in doc.paragraphs:
+
+    def _collect_para(para):
         text = para.text.strip()
         if not text:
-            continue
+            return
         if para.style.name.startswith('Heading'):
             lines.append(text.upper())
         else:
             lines.append(text)
+
+    # Main body text flow
+    for para in doc.paragraphs:
+        _collect_para(para)
+
+    # Table cells — not included in doc.paragraphs
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _collect_para(para)
+
+    # Text boxes — floating frames invisible to the python-docx API
+    for shape in doc.element.body.iter(qn('w:txbxContent')):
+        for p_elem in shape.iter(qn('w:p')):
+            text = "".join(t.text for t in p_elem.iter(qn('w:t'))).strip()
+            if text:
+                lines.append(text)
+
     raw = "\n".join(lines)
     raw = re.sub(r'\n{3,}', '\n\n', raw)
     return raw.strip()
@@ -610,6 +779,7 @@ def detect_sections(text: str) -> list:
 #  ROUTE — TEXT EXTRACTION                                                    #
 # --------------------------------------------------------------------------- #
 @app.route("/extract-text", methods=["POST"])
+@rate_limit(30, 3600)   # 30 per hour — prevent free file-parsing abuse
 def extract_text():
     try:
         if "file" not in request.files:
@@ -620,11 +790,14 @@ def extract_text():
 
         if filename.endswith(".pdf"):
             text = extract_pdf_text(file_bytes)
-        elif filename.endswith((".docx", ".doc")):
+        elif filename.endswith(".docx"):
             text = extract_docx_text(file_bytes)
+        elif filename.endswith(".doc"):
+            return jsonify({"status": "error",
+                            "message": "Old .doc format is not supported. Re-save your CV as .docx in Word and try again."}), 400
         else:
             return jsonify({"status": "error",
-                            "message": "Unsupported file type. Upload PDF or Word (.docx)."}), 400
+                            "message": "Unsupported file type. Upload a PDF or Word (.docx) file."}), 400
 
         if len(text) > MAX_CV_CHARS:
             text = text[:MAX_CV_CHARS]
@@ -645,6 +818,7 @@ def extract_text():
 #  ROUTES — AI CALLS                                                          #
 # --------------------------------------------------------------------------- #
 @app.route("/analyse-cv", methods=["POST"])
+@rate_limit(10, 3600)   # 10 per hour
 def analyse_cv():
     try:
         require_credits(ROUTE_COST["/analyse-cv"])  # 0 by design; pairs with rewrite
@@ -670,6 +844,7 @@ def analyse_cv():
 
 
 @app.route("/rewrite-cv", methods=["POST"])
+@rate_limit(10, 3600)   # 10 per hour
 def rewrite_cv():
     try:
         user_obj, charge = require_credits(ROUTE_COST["/rewrite-cv"])
@@ -700,6 +875,7 @@ def rewrite_cv():
 
 
 @app.route("/cover-letter", methods=["POST"])
+@rate_limit(10, 3600)   # 10 per hour
 def cover_letter():
     try:
         _u, charge = require_credits(ROUTE_COST["/cover-letter"])
@@ -730,6 +906,7 @@ def cover_letter():
 
 
 @app.route("/rank-cvs", methods=["POST"])
+@rate_limit(5, 3600)    # 5 per hour — each call can rank up to 20 CVs
 def rank_cvs():
     try:
         data = request.get_json(force=True) or {}
@@ -779,6 +956,7 @@ def rank_cvs():
 
 
 @app.route("/generate-plan", methods=["POST"])
+@rate_limit(5, 3600)    # 5 per hour — 5 credits per call
 def generate_plan():
     try:
         _u, charge = require_credits(ROUTE_COST["/generate-plan"])
@@ -1495,16 +1673,126 @@ def split_name(full):
 
 
 # --------------------------------------------------------------------------- #
+#  AI-OUTPUT NORMALIZATION                                                     #
+#  Claude reliably matched the requested JSON shape; Qwen sometimes doesn't    #
+#  (a string where a list was expected, null where [] was expected, a missing #
+#  nested key, etc). These helpers coerce whatever comes back into exactly    #
+#  the shape build_cv_pdf_a/b and build_cv_docx expect, so malformed AI       #
+#  output degrades to blank fields instead of throwing a 500.                 #
+# --------------------------------------------------------------------------- #
+def _as_str(v):
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else str(v)
+
+
+def _as_str_list(v):
+    if not v:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, list):
+        return [_as_str(x) for x in v if x]
+    return []
+
+
+def _as_dict_list(v, keys):
+    """Coerce into a list of dicts each having exactly `keys` as string fields."""
+    if not v:
+        return []
+    if isinstance(v, dict):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    out = []
+    for item in v:
+        if isinstance(item, dict):
+            out.append({k: _as_str(item.get(k)) for k in keys})
+        elif isinstance(item, str) and item.strip():
+            d = {k: "" for k in keys}
+            d[keys[0]] = item
+            out.append(d)
+    return out
+
+
+def normalize_cv(cv: dict) -> dict:
+    cv = cv if isinstance(cv, dict) else {}
+    str_fields = ["fullText", "header", "summary", "experience", "skills", "education",
+                  "certifications", "candidateName", "candidateEmail", "candidatePhone",
+                  "candidateLinkedIn", "candidateWebsite", "candidateLocation",
+                  "titleLine", "companyName"]
+    return {k: _as_str(cv.get(k)) for k in str_fields}
+
+
+def normalize_pdf_data(pdf_data: dict) -> dict:
+    pdf_data = pdf_data if isinstance(pdf_data, dict) else {}
+
+    raw_items = pdf_data.get("experienceItems")
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        raw_items = []
+    exp_out = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        exp_out.append({
+            "role": _as_str(item.get("role")),
+            "company": _as_str(item.get("company")),
+            "location": _as_str(item.get("location")),
+            "dates": _as_str(item.get("dates")),
+            "bullets": _as_str_list(item.get("bullets")),
+        })
+
+    return {
+        "expertise": _as_str_list(pdf_data.get("expertise")),
+        "tools": _as_str_list(pdf_data.get("tools")),
+        "education": _as_dict_list(pdf_data.get("education"), ["degree", "school", "years"]),
+        "certifications": _as_dict_list(pdf_data.get("certifications"), ["name", "org"]),
+        "projects": _as_str_list(pdf_data.get("projects")),
+        "experienceItems": exp_out,
+    }
+
+
+def normalize_letter(letter: dict) -> dict:
+    letter = letter if isinstance(letter, dict) else {}
+    fields = ["opening", "body1", "body2", "body3Remote", "closing",
+              "fullText", "signoffName", "tagline"]
+    return {k: _as_str(letter.get(k)) for k in fields}
+
+
+def normalize_prep(prep: dict) -> dict:
+    prep = prep if isinstance(prep, dict) else {}
+    raw_qs = prep.get("questions")
+    if not isinstance(raw_qs, list):
+        raw_qs = []
+    out_qs = []
+    for q in raw_qs:
+        if not isinstance(q, dict):
+            continue
+        star = q.get("starAnswer")
+        if not isinstance(star, dict):
+            star = {}
+        out_qs.append({
+            "question": _as_str(q.get("question")),
+            "weakness": _as_str(q.get("weakness")),
+            "starAnswer": {k: _as_str(star.get(k)) for k in ["situation", "task", "action", "result"]},
+            "needsRealExample": bool(q.get("needsRealExample")),
+        })
+    return {"questions": out_qs}
+
+
+# --------------------------------------------------------------------------- #
 #  ROUTE — GENERATE PDFs                                                      #
 # --------------------------------------------------------------------------- #
 @app.route("/generate-pdfs", methods=["POST"])
 def generate_pdfs():
     try:
         data = request.get_json(force=True) or {}
-        cv = data.get("rewrittenCV") or {}
-        pdf_data = data.get("pdfData") or {}
-        letter = data.get("coverLetter") or {}
-        prep = data.get("interviewPrep") or {}
+        cv = normalize_cv(data.get("rewrittenCV"))
+        pdf_data = normalize_pdf_data(data.get("pdfData"))
+        letter = normalize_letter(data.get("coverLetter")) if data.get("coverLetter") else {}
+        prep = normalize_prep(data.get("interviewPrep")) if data.get("interviewPrep") else {}
         company = data.get("companyName") or cv.get("companyName") or "Company"
         date_str = data.get("dateStr") or ""
         salutation = data.get("salutation") or "Dear Hiring Manager,"
@@ -1541,10 +1829,10 @@ def generate_pdfs():
 def generate_docx():
     try:
         data = request.get_json(force=True) or {}
-        cv = data.get("rewrittenCV") or {}
-        pdf_data = data.get("pdfData") or {}
-        letter = data.get("coverLetter") or {}
-        prep = data.get("interviewPrep") or {}
+        cv = normalize_cv(data.get("rewrittenCV"))
+        pdf_data = normalize_pdf_data(data.get("pdfData"))
+        letter = normalize_letter(data.get("coverLetter")) if data.get("coverLetter") else {}
+        prep = normalize_prep(data.get("interviewPrep")) if data.get("interviewPrep") else {}
         company = data.get("companyName") or cv.get("companyName") or "Company"
         date_str = data.get("dateStr") or ""
         salutation = data.get("salutation") or "Dear Hiring Manager,"
@@ -1582,7 +1870,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "Sofia",
-        "aiConfigured": _anthropic is not None,
+        "aiConfigured": _qwen is not None,
         "creditsEnforced": ENFORCE_CREDITS,
         "fonts": _REGISTERED,
     })
@@ -1598,7 +1886,6 @@ app.add_url_rule("/auth/login",  view_func=login,  methods=["POST"])
 app.add_url_rule("/auth/me",     view_func=get_me, methods=["GET"])
 
 
-
 # --------------------------------------------------------------------------- #
 #  PAYMENT ROUTES                                                              #
 # --------------------------------------------------------------------------- #
@@ -1607,15 +1894,17 @@ from Payment import (  # noqa: E402
     paystack_webhook, monnify_webhook,
 )
 
-app.add_url_rule("/credits/packages",          view_func=get_packages,      methods=["GET"])
-app.add_url_rule("/credits/initiate",          view_func=initiate_payment,  methods=["POST"])
-app.add_url_rule("/credits/verify",            view_func=verify_payment,    methods=["POST"])
-app.add_url_rule("/credits/webhook/paystack",  view_func=paystack_webhook,  methods=["POST"])
-app.add_url_rule("/credits/webhook/monnify",   view_func=monnify_webhook,   methods=["POST"])
+app.add_url_rule("/credits/packages",         view_func=get_packages,     methods=["GET"])
+app.add_url_rule("/credits/initiate",         view_func=initiate_payment, methods=["POST"])
+app.add_url_rule("/credits/verify",           view_func=verify_payment,   methods=["POST"])
+app.add_url_rule("/credits/webhook/paystack", view_func=paystack_webhook, methods=["POST"])
+app.add_url_rule("/credits/webhook/monnify",  view_func=monnify_webhook,  methods=["POST"])
 
 
 if __name__ == "__main__":
-    from db import init_db
-    init_db()
+    try:
+        from db import init_db
+        init_db()
+    except Exception as _db_err:
+        log.warning("Database not reachable at startup (auth/credits will fail until connected): %s", _db_err)
     app.run(host="0.0.0.0", port=5000, debug=DEBUG_MODE)
-
