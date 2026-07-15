@@ -1,9 +1,0 @@
-# Sofia — Development & testing dependencies
-# Install alongside the main requirements:
-#   pip install -r requirements.txt -r requirements-dev.txt
-
--r requirements.txt
-
-# ── Testing ────────────────────────────────────────────────────────────────
-pytest==8.3.5
-pytest-asyncio==0.24.0
